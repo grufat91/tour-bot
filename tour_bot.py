@@ -43,12 +43,35 @@ def add_markup(text: str):
     return PRICE_RE.sub(repl, text), changes
 
 
-def build_post(text: str) -> str:
+BRAND = os.environ.get("BRAND_NAME", "RR TOURS")
+
+# Satıcının əlaqə məlumatı olan sətirlər silinir (müştəri birbaşa ona getməsin)
+CONTACT_RE = re.compile(
+    r"(\+?\d[\d\s\-()]{8,}\d|https?://|t\.me/|wa\.me/|@\w{3,}|whatsapp|əlaqə|elaqe|zəng|zeng|\btel[:.]|nömrə|nomre)",
+    re.IGNORECASE,
+)
+
+
+def clean_text(text: str) -> str:
+    lines = [l for l in text.splitlines() if not CONTACT_RE.search(l)]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def build_post(text: str, changes) -> str:
+    body = clean_text(text)
+    main_price = changes[0][1]
+    price_line = f"{main_price} AZN" + ("-dən başlayaraq" if len(changes) > 1 else "")
     return (
-        f"✈️ {text.strip()}\n\n"
-        "━━━━━━━━━━━━━━\n"
-        f"📞 Sifariş üçün: {WHATSAPP} (WhatsApp)\n"
-        "✅ Ən yaxşı qiymət zəmanəti"
+        f"🌍 *{BRAND}* 🌍\n"
+        "✨ *ÖZƏL TUR TƏKLİFİ* ✨\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{body}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💎 *QİYMƏT: {price_line}*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📲 *Sifariş:* {WHATSAPP}\n"
+        "⏳ Yerlər məhduddur — tələsin!\n"
+        "🛡️ Rəsmi rezervasiya · Etibarlı xidmət"
     )
 
 
@@ -71,7 +94,7 @@ async def private_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Qiymət tapılmadı. Mətndə məs. '1500 AZN' olmalıdır.")
         return
 
-    await send_post(context, msg.chat_id, msg, build_post(new_text))
+    await send_post(context, msg.chat_id, msg, build_post(new_text, changes))
     summary = ", ".join(f"{o} → {n}" for o, n in changes)
     await msg.reply_text(f"✅ Hazırdır ({summary} AZN). Yuxarıdakını WhatsApp-a forward et.")
     log.info("private: %s", summary)
@@ -84,7 +107,7 @@ async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not changes:
         return  # qiymətsiz postlara toxunmuruq
 
-    await send_post(context, msg.chat_id, msg, build_post(new_text))
+    await send_post(context, msg.chat_id, msg, build_post(new_text, changes))
     try:
         await msg.delete()
     except Exception as e:
