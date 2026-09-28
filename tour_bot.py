@@ -1,101 +1,145 @@
 #!/usr/bin/env python3
 """
-Tour Bot - Telegram → WhatsApp
-Satıcılar: Telegram Kanalına tur yazır (+150 AZN otomatik əlavə)
-Müştərilər: WhatsApp Kanalında görür
+Tour Bot
+- Bota (şəxsi çatda) tur mətni/şəkli göndər -> qiymətə +MARKUP əlavə edib hazır postu qaytarır
+- Kanalda post olsa -> formatlanmış versiyanı kanala atır, orijinalı silir
+Token kodda YOXDUR - Render Environment-də BOT_TOKEN kimi saxlanılır.
 """
 
-from telegram import Bot, Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import logging
+import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Config
-TOKEN = "8911797784:AAH12z6PnSdqCX6pi_50s66EAtYhLMRcEN4"
-TELEGRAM_CHANNEL = -1003303207925
-MARKUP_AZN = 150
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# Log
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TOKEN = os.environ["BOT_TOKEN"]
+MARKUP_AZN = int(os.environ.get("MARKUP_AZN", "150"))
+WHATSAPP = os.environ.get("WHATSAPP_NUMBER", "+994 50 XXX XX XX")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Telegram mesajını oxu:
-    1. Qiyməti tap
-    2. +150 AZN əlavə et
-    3. Premium template-ə doldur
-    4. Geri göndər
-    """
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("tour-bot")
 
-    try:
-        msg_text = update.message.text
-
-        # Qiymət tap (nümunə: "2480 AZN" → 2480)
-        price_match = re.search(r'(\d+)\s*(?:AZN|₼)', msg_text)
-        original_price = int(price_match.group(1)) if price_match else 0
-        new_price = original_price + MARKUP_AZN if original_price > 0 else 0
-
-        # Premium Template
-        formatted_msg = f"""
-✈️ TUR PAKET
-
-{msg_text}
-
-━━━━━━━━━━━━━━━━
-💰 SƏN'İN QİYMƏTİ: {new_price} AZN
-   (+{MARKUP_AZN} AZN kommissiya əlavə edildi)
-━━━━━━━━━━━━━━━━
-
-📞 SİFARİŞ ET:
-+994 50 XXX XX XX (WhatsApp)
-
-✅ Həmişə ən yaxşı qiymətlər!
-"""
-
-        # Mesajı göndər
-        await context.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL,
-            text=formatted_msg,
-            parse_mode="HTML"
-        )
-
-        # Satıcıya cavab
-        await update.message.reply_text(
-            f"✅ Tur qəbul edildi!\n\n"
-            f"Orijinal: {original_price} AZN\n"
-            f"Yeni: {new_price} AZN\n\n"
-            f"Müştərilərə göndərilir..."
-        )
-
-        logger.info(f"Tour processed: {original_price} → {new_price} AZN")
-
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        await update.message.reply_text(f"❌ Xəta: {str(e)}")
+# "1500 AZN", "1 500 ₼", "1.500 azn", "2480manat"
+PRICE_RE = re.compile(
+    r"(?<![\d.,])(\d{1,3}(?:[ .,]\d{3})+|\d+)\s*(AZN|₼|manat)",
+    re.IGNORECASE,
+)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    await update.message.reply_text(
-        "🤖 Tour Bot Aktiv!\n\n"
-        "Turlarınızı yazın, mən otomatik olaraq:\n"
-        "✅ Qiymətə +150 AZN əlavə edəcəyəm\n"
-        "✅ Template-ə dolduracağam\n"
-        "✅ Müştərilərə göndərəcəyəm"
+def add_markup(text: str):
+    """Mətndəki bütün AZN qiymətlərinə MARKUP əlavə edir."""
+    changes = []
+
+    def repl(m):
+        old = int(re.sub(r"\D", "", m.group(1)))
+        new = old + MARKUP_AZN
+        changes.append((old, new))
+        return f"{new} {m.group(2)}"
+
+    return PRICE_RE.sub(repl, text), changes
+
+
+def build_post(text: str) -> str:
+    return (
+        f"✈️ {text.strip()}\n\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📞 Sifariş üçün: {WHATSAPP} (WhatsApp)\n"
+        "✅ Ən yaxşı qiymət zəmanəti"
     )
 
 
+async def send_post(context, chat_id, msg, post):
+    """Şəkil varsa şəkil + caption, yoxdursa mətn göndərir."""
+    if msg.photo and len(post) <= 1024:
+        await context.bot.send_photo(chat_id, msg.photo[-1].file_id, caption=post)
+    else:
+        if msg.photo:
+            await context.bot.send_photo(chat_id, msg.photo[-1].file_id)
+        await context.bot.send_message(chat_id, post)
+
+
+async def private_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = msg.text or msg.caption or ""
+    new_text, changes = add_markup(text)
+
+    if not changes:
+        await msg.reply_text("⚠️ Qiymət tapılmadı. Mətndə məs. '1500 AZN' olmalıdır.")
+        return
+
+    await send_post(context, msg.chat_id, msg, build_post(new_text))
+    summary = ", ".join(f"{o} → {n}" for o, n in changes)
+    await msg.reply_text(f"✅ Hazırdır ({summary} AZN). Yuxarıdakını WhatsApp-a forward et.")
+    log.info("private: %s", summary)
+
+
+async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = msg.text or msg.caption or ""
+    new_text, changes = add_markup(text)
+    if not changes:
+        return  # qiymətsiz postlara toxunmuruq
+
+    await send_post(context, msg.chat_id, msg, build_post(new_text))
+    try:
+        await msg.delete()
+    except Exception as e:
+        log.warning("orijinal silinmədi: %s", e)
+    log.info("channel: %s", changes)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        f"🤖 Tour Bot aktivdir!\n\nTur mətnini (və ya şəkil+mətn) göndər — "
+        f"qiymətə +{MARKUP_AZN} AZN əlavə edib hazır post qaytaracağam."
+    )
+
+
+class Health(BaseHTTPRequestHandler):
+    """Render Web Service port tələb edir + ping üçün."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), Health).serve_forever()
+
+
 def main():
-    """Bot start"""
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
+            private_handler,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POSTS & (filters.TEXT | filters.PHOTO),
+            channel_handler,
+        )
+    )
 
-    # Handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Start
-    logger.info("Bot başladı...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Bot başladı...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
